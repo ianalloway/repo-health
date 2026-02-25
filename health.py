@@ -108,6 +108,8 @@ def build_report(results: list[dict]) -> str:
 
 
 def main():
+    global GITHUB_TOKEN, GITHUB_USER, STALE_DAYS
+
     parser = argparse.ArgumentParser(description="Scan GitHub repos for health metrics.")
     parser.add_argument("--user", default=GITHUB_USER, help="GitHub username")
     parser.add_argument("--token", default=GITHUB_TOKEN, help="GitHub API token")
@@ -115,7 +117,6 @@ def main():
     parser.add_argument("--stale-days", type=int, default=STALE_DAYS, help="Days before a repo is stale")
     args = parser.parse_args()
 
-    global GITHUB_TOKEN, GITHUB_USER, STALE_DAYS
     GITHUB_TOKEN = args.token
     GITHUB_USER = args.user
     STALE_DAYS = args.stale_days
