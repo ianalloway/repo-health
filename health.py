@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -24,6 +25,9 @@ OUTPUT_DIR = Path.home() / ".repo-health"
 STALE_DAYS = 90
 
 API_BASE = "https://api.github.com"
+
+# Valid columns for --sort
+SORT_COLUMNS = ("score", "name", "stars", "last_push", "open_issues")
 
 
 def github_headers() -> dict:
@@ -83,6 +87,41 @@ def check_topics(user: str, repo: str) -> list[str]:
     if resp.status_code == 200:
         return resp.json().get("names", [])
     return []
+
+
+def check_repo_health(user: str, repo: dict) -> dict:
+    """
+    Run all health checks for a single repo and return its result dict.
+
+    This function is designed to be called from a thread pool — all four
+    GitHub API checks (README, LICENSE, CI, topics) are issued from the
+    same thread so they can run concurrently across repos.
+    """
+    name = repo["name"]
+    has_readme = check_file_exists(user, name, "README.md")
+    has_license = (
+        check_file_exists(user, name, "LICENSE")
+        or check_file_exists(user, name, "LICENSE.md")
+    )
+    has_ci = check_ci_exists(user, name)
+    topics = check_topics(user, name)
+    score, flags = score_repo(repo, has_readme, has_license, has_ci, topics)
+
+    pushed_at = repo.get("pushed_at") or "N/A"
+    if pushed_at != "N/A":
+        pushed_at = pushed_at[:10]
+
+    return {
+        "name": name,
+        "score": score,
+        "flags": flags,
+        "last_push": pushed_at,
+        "open_issues": repo.get("open_issues_count", 0),
+        "stars": repo.get("stargazers_count", 0),
+        "url": repo.get("html_url", ""),
+        "has_ci": has_ci,
+        "topics": topics,
+    }
 
 
 def score_repo(
@@ -175,6 +214,21 @@ def build_report_markdown(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def sort_results(results: list[dict], sort_by: str, descending: bool = True) -> list[dict]:
+    """Sort results by the given column name."""
+    reverse = descending
+
+    if sort_by == "name":
+        # Names sort ascending by default (alphabetical)
+        reverse = not descending
+        return sorted(results, key=lambda x: x["name"].lower(), reverse=reverse)
+    elif sort_by == "last_push":
+        # ISO date strings sort correctly as strings; treat "N/A" as oldest
+        return sorted(results, key=lambda x: x["last_push"] if x["last_push"] != "N/A" else "0000-00-00", reverse=reverse)
+    else:
+        return sorted(results, key=lambda x: x.get(sort_by, 0), reverse=reverse)
+
+
 def main():
     global GITHUB_TOKEN, GITHUB_USER, STALE_DAYS
 
@@ -185,6 +239,24 @@ def main():
     parser.add_argument("--stale-days", type=int, default=STALE_DAYS, help="Days before a repo is stale")
     parser.add_argument("--min-score", type=int, default=0, help="Only show repos with score below this value")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
+    parser.add_argument(
+        "--sort",
+        choices=SORT_COLUMNS,
+        default="score",
+        help=f"Column to sort results by. Choices: {', '.join(SORT_COLUMNS)}. Default: score",
+    )
+    parser.add_argument(
+        "--asc",
+        action="store_true",
+        help="Sort ascending instead of descending (default is descending)",
+    )
+    parser.add_argument(
+        "--parallel", "-P",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Max concurrent threads for repo health checks (default: 8). Use 1 to disable.",
+    )
     args = parser.parse_args()
 
     GITHUB_TOKEN = args.token
@@ -203,44 +275,39 @@ def main():
         console.print("[red]No repos found or API error.[/red]")
         return
 
-    console.print(f"[green]Found {len(repos)} repos. Checking health...[/green]\n")
+    workers = max(1, min(args.parallel, len(repos)))
+    console.print(
+        f"[green]Found {len(repos)} repos. Checking health "
+        f"({'parallel ×' + str(workers) if workers > 1 else 'sequential'})...[/green]\n"
+    )
 
     previous_scores = load_previous_report()
     results = []
 
-    for repo in repos:
-        name = repo["name"]
-        console.print(f"  checking [cyan]{name}[/cyan]...", end="\r")
-        has_readme = check_file_exists(GITHUB_USER, name, "README.md")
-        has_license = (
-            check_file_exists(GITHUB_USER, name, "LICENSE")
-            or check_file_exists(GITHUB_USER, name, "LICENSE.md")
-        )
-        has_ci = check_ci_exists(GITHUB_USER, name)
-        topics = check_topics(GITHUB_USER, name)
-        score, flags = score_repo(repo, has_readme, has_license, has_ci, topics)
+    # Parallel health checks — each repo's 4 API calls run in its own thread,
+    # so N repos finish in ~1 serial-time instead of ~N serial-times.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_repo = {
+            pool.submit(check_repo_health, GITHUB_USER, repo): repo
+            for repo in repos
+        }
+        for future in as_completed(future_to_repo):
+            repo = future_to_repo[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                console.print(f"[red]Error checking {repo['name']}: {exc}[/red]")
+                continue
 
-        pushed_at = repo.get("pushed_at") or "N/A"
-        if pushed_at != "N/A":
-            pushed_at = pushed_at[:10]
+            prev_score = previous_scores.get(result["name"])
+            result["delta"] = (result["score"] - prev_score) if prev_score is not None else None
+            results.append(result)
+            console.print(f"  ✓ [cyan]{result['name']}[/cyan] — {result['score']}/100", end="\r")
 
-        prev_score = previous_scores.get(name)
-        delta = (score - prev_score) if prev_score is not None else None
+    console.print()  # clear the \r line
 
-        results.append({
-            "name": name,
-            "score": score,
-            "flags": flags,
-            "last_push": pushed_at,
-            "open_issues": repo.get("open_issues_count", 0),
-            "stars": repo.get("stargazers_count", 0),
-            "url": repo.get("html_url", ""),
-            "has_ci": has_ci,
-            "topics": topics,
-            "delta": delta,
-        })
-
-    results.sort(key=lambda x: x["score"], reverse=True)
+    # Sort
+    results = sort_results(results, args.sort, descending=not args.asc)
 
     # Filter if --min-score flag used (show only repos below threshold)
     display_results = results
@@ -251,15 +318,17 @@ def main():
         print(json.dumps(display_results, indent=2))
         return
 
+    sort_indicator = f"{args.sort} {'↑' if args.asc else '↓'}"
+
     # Rich table
     table = Table(
-        title=f"Repo Health: {GITHUB_USER}",
+        title=f"Repo Health: {GITHUB_USER}  [dim](sorted by {sort_indicator})[/dim]",
         box=box.ROUNDED,
         show_header=True,
         expand=True,
     )
     table.add_column("Repo", style="cyan", no_wrap=True)
-    table.add_column("Score", justify="right", width=8)
+    table.add_column("Score", justify="right", width=10)
     table.add_column("CI", justify="center", width=4)
     table.add_column("Topics", width=20)
     table.add_column("Flags", style="yellow")
