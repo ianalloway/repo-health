@@ -8,6 +8,8 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -30,6 +32,23 @@ API_BASE = "https://api.github.com"
 SORT_COLUMNS = ("score", "name", "stars", "last_push", "open_issues")
 
 
+# ---------- Rate limiter ----------
+_rate_lock = threading.Lock()
+_RATE_INTERVAL = 0.15  # seconds between requests (~6.7 req/s, well under 5000/hr auth limit)
+
+def _rate_limited_get(url, **kwargs):
+    """requests.get wrapper with rate limiting and exponential backoff for 429s."""
+    with _rate_lock:
+        time.sleep(_RATE_INTERVAL)
+    for attempt in range(5):
+        resp = _rate_limited_get(url, **kwargs)
+        if resp.status_code != 429:
+            return resp
+        wait = 2 ** attempt
+        time.sleep(wait)
+    return resp  # return last response even if still 429
+
+
 def github_headers() -> dict:
     headers = {"Accept": "application/vnd.github.v3+json"}
     if GITHUB_TOKEN:
@@ -42,7 +61,7 @@ def fetch_repos(user: str) -> list[dict]:
     page = 1
     while True:
         url = f"{API_BASE}/users/{user}/repos?per_page=100&page={page}&type=owner"
-        resp = requests.get(url, headers=github_headers(), timeout=15)
+        resp = _rate_limited_get(url, headers=github_headers(), timeout=15)
         if resp.status_code == 401:
             print("[error] GitHub API: bad credentials. Set GITHUB_TOKEN env var.", file=sys.stderr)
             sys.exit(1)
@@ -59,14 +78,14 @@ def fetch_repos(user: str) -> list[dict]:
 
 def check_file_exists(user: str, repo: str, filename: str) -> bool:
     url = f"{API_BASE}/repos/{user}/{repo}/contents/{filename}"
-    resp = requests.get(url, headers=github_headers(), timeout=10)
+    resp = _rate_limited_get(url, headers=github_headers(), timeout=10)
     return resp.status_code == 200
 
 
 def check_ci_exists(user: str, repo: str) -> bool:
     """Check if the repo has a GitHub Actions workflow."""
     url = f"{API_BASE}/repos/{user}/{repo}/contents/.github/workflows"
-    resp = requests.get(url, headers=github_headers(), timeout=10)
+    resp = _rate_limited_get(url, headers=github_headers(), timeout=10)
     if resp.status_code == 200:
         try:
             files = resp.json()
@@ -79,7 +98,7 @@ def check_ci_exists(user: str, repo: str) -> bool:
 def check_topics(user: str, repo: str) -> list[str]:
     """Fetch topics/tags for a repo."""
     url = f"{API_BASE}/repos/{user}/{repo}/topics"
-    resp = requests.get(
+    resp = _rate_limited_get(
         url,
         headers={**github_headers(), "Accept": "application/vnd.github.mercy-preview+json"},
         timeout=10,
@@ -234,7 +253,6 @@ def main():
 
     parser = argparse.ArgumentParser(description="Scan GitHub repos for health metrics.")
     parser.add_argument("--user", default=GITHUB_USER, help="GitHub username")
-    parser.add_argument("--token", default=GITHUB_TOKEN, help="GitHub API token")
     parser.add_argument("--no-save", action="store_true", help="Skip saving report files")
     parser.add_argument("--stale-days", type=int, default=STALE_DAYS, help="Days before a repo is stale")
     parser.add_argument("--min-score", type=int, default=0, help="Only show repos with score below this value")
@@ -259,7 +277,6 @@ def main():
     )
     args = parser.parse_args()
 
-    GITHUB_TOKEN = args.token
     GITHUB_USER = args.user
     STALE_DAYS = args.stale_days
 
