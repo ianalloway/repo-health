@@ -4,6 +4,8 @@ repo-health: Scan all GitHub repos for ianalloway and score their health.
 Outputs a ranked rich table and saves a markdown report.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -17,8 +19,8 @@ from pathlib import Path
 import requests
 from rich import box
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -32,27 +34,87 @@ API_BASE = "https://api.github.com"
 SORT_COLUMNS = ("score", "name", "stars", "last_push", "open_issues")
 
 
+# ---------- Scoring weights ----------
+MISSING_README_PENALTY = 25
+MISSING_LICENSE_PENALTY = 15
+MISSING_DESCRIPTION_PENALTY = 15
+MISSING_CI_PENALTY = 10
+MISSING_TOPICS_PENALTY = 5
+STALE_PENALTY = 15
+NO_PUSH_DATE_PENALTY = 10
+MANY_ISSUES_THRESHOLD = 10
+MANY_ISSUES_PENALTY = 10
+SOME_ISSUES_PENALTY = 3
+STARS_BONUS_THRESHOLD = 5
+STARS_BONUS = 5
+FORKS_BONUS_THRESHOLD = 2
+FORKS_BONUS = 3
+
+README_NAMES = {"readme", "readme.md", "readme.rst", "readme.txt"}
+LICENSE_NAMES = {"license", "license.md", "license.txt", "licence", "licence.md", "copying"}
+
+
 # ---------- Rate limiter ----------
+# GitHub allows 60 req/hr unauthenticated and 5,000 req/hr with a token.
+# Each run makes 1 request per 100 repos to list them, plus 3 per repo
+# (root contents, .github/workflows, topics).
 _rate_lock = threading.Lock()
 _RATE_INTERVAL = 0.15  # seconds between requests (~6.7 req/s, well under 5000/hr auth limit)
+MAX_RETRIES = 5
+MAX_BACKOFF_SECONDS = 60.0
+
+
+def _retry_delay(resp, attempt: int) -> float | None:
+    """Seconds to wait before retrying ``resp``, or None if it should not be retried."""
+    if resp.status_code not in (403, 429):
+        return None
+    headers = resp.headers or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return min(float(retry_after), MAX_BACKOFF_SECONDS)
+        except ValueError:
+            pass
+    if headers.get("X-RateLimit-Remaining") == "0":
+        reset = headers.get("X-RateLimit-Reset")
+        if reset is not None:
+            try:
+                wait = float(reset) - time.time()
+            except ValueError:
+                wait = 0.0
+            if wait > MAX_BACKOFF_SECONDS:
+                return None  # primary limit exhausted for a long time; don't hang
+            return max(wait, 1.0)
+    if resp.status_code == 429:
+        return min(2.0 ** attempt, MAX_BACKOFF_SECONDS)
+    # Plain 403 (e.g. permissions) is not a rate limit: don't retry.
+    return None
+
 
 def _rate_limited_get(url, **kwargs):
-    """requests.get wrapper with rate limiting and exponential backoff for 429s."""
-    with _rate_lock:
-        time.sleep(_RATE_INTERVAL)
-    for attempt in range(5):
-        resp = _rate_limited_get(url, **kwargs)
-        if resp.status_code != 429:
+    """requests.get wrapper with request spacing and backoff for rate-limit responses.
+
+    Retries 429s with exponential backoff (honouring Retry-After) and 403s that
+    GitHub marks as rate limited (X-RateLimit-Remaining: 0 / Retry-After).
+    """
+    timeout = kwargs.pop("timeout", 15)
+    resp = None
+    for attempt in range(MAX_RETRIES):
+        with _rate_lock:
+            time.sleep(_RATE_INTERVAL)
+        resp = requests.get(url, timeout=timeout, **kwargs)
+        delay = _retry_delay(resp, attempt)
+        if delay is None or attempt == MAX_RETRIES - 1:
             return resp
-        wait = 2 ** attempt
-        time.sleep(wait)
-    return resp  # return last response even if still 429
+        time.sleep(delay)
+    return resp  # pragma: no cover - loop always returns
 
 
 def github_headers() -> dict:
-    headers = {"Accept": "application/vnd.github.v3+json"}
+    """Request headers. The token is only ever read from the GITHUB_TOKEN env var."""
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
     return headers
 
 
@@ -76,10 +138,19 @@ def fetch_repos(user: str) -> list[dict]:
     return repos
 
 
-def check_file_exists(user: str, repo: str, filename: str) -> bool:
-    url = f"{API_BASE}/repos/{user}/{repo}/contents/{filename}"
+def list_root_files(user: str, repo: str) -> set[str]:
+    """Lower-cased names of the files in the repo root, from one API call."""
+    url = f"{API_BASE}/repos/{user}/{repo}/contents/"
     resp = _rate_limited_get(url, headers=github_headers(), timeout=10)
-    return resp.status_code == 200
+    if resp.status_code != 200:
+        return set()
+    try:
+        entries = resp.json()
+    except ValueError:
+        return set()
+    if not isinstance(entries, list):
+        return set()
+    return {str(e.get("name", "")).lower() for e in entries if isinstance(e, dict)}
 
 
 def check_ci_exists(user: str, repo: str) -> bool:
@@ -112,16 +183,14 @@ def check_repo_health(user: str, repo: dict) -> dict:
     """
     Run all health checks for a single repo and return its result dict.
 
-    This function is designed to be called from a thread pool — all four
-    GitHub API checks (README, LICENSE, CI, topics) are issued from the
-    same thread so they can run concurrently across repos.
+    This function is designed to be called from a thread pool. Its three
+    GitHub API calls (root listing for README/LICENSE, CI, topics) are issued
+    from the same thread so they can run concurrently across repos.
     """
     name = repo["name"]
-    has_readme = check_file_exists(user, name, "README.md")
-    has_license = (
-        check_file_exists(user, name, "LICENSE")
-        or check_file_exists(user, name, "LICENSE.md")
-    )
+    root_files = list_root_files(user, name)
+    has_readme = bool(root_files & README_NAMES)
+    has_license = bool(root_files & LICENSE_NAMES)
     has_ci = check_ci_exists(user, name)
     topics = check_topics(user, name)
     score, flags = score_repo(repo, has_readme, has_license, has_ci, topics)
@@ -154,19 +223,19 @@ def score_repo(
     score = 100
 
     if not has_readme:
-        score -= 25
+        score -= MISSING_README_PENALTY
         flags.append("no README")
     if not has_license:
-        score -= 15
+        score -= MISSING_LICENSE_PENALTY
         flags.append("no LICENSE")
     if not repo.get("description"):
-        score -= 15
+        score -= MISSING_DESCRIPTION_PENALTY
         flags.append("no description")
     if not has_ci:
-        score -= 10
+        score -= MISSING_CI_PENALTY
         flags.append("no CI")
     if not topics:
-        score -= 5
+        score -= MISSING_TOPICS_PENALTY
         flags.append("no topics")
 
     # Stale check
@@ -175,24 +244,24 @@ def score_repo(
         last = datetime.fromisoformat(pushed_at.replace("Z", "+00:00"))
         age_days = (datetime.now(timezone.utc) - last).days
         if age_days > STALE_DAYS:
-            score -= 15
+            score -= STALE_PENALTY
             flags.append(f"stale ({age_days}d)")
     else:
         flags.append("no push date")
-        score -= 10
+        score -= NO_PUSH_DATE_PENALTY
 
     open_issues = repo.get("open_issues_count", 0)
-    if open_issues > 10:
-        score -= 10
+    if open_issues > MANY_ISSUES_THRESHOLD:
+        score -= MANY_ISSUES_PENALTY
         flags.append(f"{open_issues} open issues")
     elif open_issues > 0:
-        score -= 3
+        score -= SOME_ISSUES_PENALTY
 
     # Bonus: starred or forked repos get a small credibility bump
-    if repo.get("stargazers_count", 0) >= 5:
-        score += 5
-    if repo.get("forks_count", 0) >= 2:
-        score += 3
+    if repo.get("stargazers_count", 0) >= STARS_BONUS_THRESHOLD:
+        score += STARS_BONUS
+    if repo.get("forks_count", 0) >= FORKS_BONUS_THRESHOLD:
+        score += FORKS_BONUS
 
     return max(0, min(100, score)), flags
 
@@ -248,10 +317,17 @@ def sort_results(results: list[dict], sort_by: str, descending: bool = True) -> 
         return sorted(results, key=lambda x: x.get(sort_by, 0), reverse=reverse)
 
 
-def main():
-    global GITHUB_TOKEN, GITHUB_USER, STALE_DAYS
+REMOVED_CLI_FLAG_MSG = (
+    "--token is no longer supported: tokens passed on the command line leak into "
+    "shell history and process listings. Set the GITHUB_TOKEN environment variable instead."
+)
 
-    parser = argparse.ArgumentParser(description="Scan GitHub repos for health metrics.")
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Scan GitHub repos for health metrics.",
+        epilog="Authentication: set the GITHUB_TOKEN environment variable (never pass tokens as arguments).",
+    )
     parser.add_argument("--user", default=GITHUB_USER, help="GitHub username")
     parser.add_argument("--no-save", action="store_true", help="Skip saving report files")
     parser.add_argument("--stale-days", type=int, default=STALE_DAYS, help="Days before a repo is stale")
@@ -275,7 +351,19 @@ def main():
         metavar="N",
         help="Max concurrent threads for repo health checks (default: 8). Use 1 to disable.",
     )
-    args = parser.parse_args()
+    # Hidden: kept only so old invocations fail loudly instead of silently
+    # ignoring the value. The value is never used or echoed.
+    parser.add_argument("--token", help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv=None):
+    global GITHUB_USER, STALE_DAYS
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.token is not None:
+        parser.error(REMOVED_CLI_FLAG_MSG)
 
     GITHUB_USER = args.user
     STALE_DAYS = args.stale_days
@@ -387,15 +475,15 @@ def main():
     no_topics_count = sum(1 for r in results if "no topics" in r["flags"])
 
     summary = Text()
-    summary.append(f"\nAverage score:    ", style="bold")
+    summary.append("\nAverage score:    ", style="bold")
     summary.append(f"{avg_score:.1f}/100\n")
-    summary.append(f"Clean repos:      ", style="bold")
+    summary.append("Clean repos:      ", style="bold")
     summary.append(f"{clean_count}/{len(results)}\n")
-    summary.append(f"Repos with CI:    ", style="bold")
+    summary.append("Repos with CI:    ", style="bold")
     summary.append(f"{ci_count}/{len(results)}\n")
-    summary.append(f"Missing desc:     ", style="bold")
+    summary.append("Missing desc:     ", style="bold")
     summary.append(f"{no_desc_count} repos\n", style="yellow" if no_desc_count else "")
-    summary.append(f"Missing topics:   ", style="bold")
+    summary.append("Missing topics:   ", style="bold")
     summary.append(f"{no_topics_count} repos", style="yellow" if no_topics_count else "")
 
     console.print(Panel(summary, title="Summary", expand=False))
