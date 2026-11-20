@@ -56,10 +56,10 @@ LICENSE_NAMES = {"license", "license.md", "license.txt", "licence", "licence.md"
 
 # ---------- Rate limiter ----------
 # GitHub allows 60 req/hr unauthenticated and 5,000 req/hr with a token.
-# Each run makes 1 request per 100 repos to list them, plus 3 per repo
-# (root contents, .github/workflows, topics).
+# Each run makes 1 request per 100 repos to list them, plus 2 per repo
+# (root contents and workflows). Fetch topics separately for legacy responses.
 _rate_lock = threading.Lock()
-_RATE_INTERVAL = 0.15  # seconds between requests (~6.7 req/s, well under 5000/hr auth limit)
+_RATE_INTERVAL = 0.15  # seconds between requests (~6.7 req/s; hourly quotas still apply)
 MAX_RETRIES = 5
 MAX_BACKOFF_SECONDS = 60.0
 
@@ -129,7 +129,7 @@ def fetch_repos(user: str) -> list[dict]:
             sys.exit(1)
         if resp.status_code != 200:
             print(f"[error] GitHub API returned {resp.status_code}: {resp.text}", file=sys.stderr)
-            break
+            sys.exit(1)
         batch = resp.json()
         if not batch:
             break
@@ -138,61 +138,56 @@ def fetch_repos(user: str) -> list[dict]:
     return repos
 
 
+def _repo_field(user: str, repo: str, path: str, expected: type):
+    resp = _rate_limited_get(f"{API_BASE}/repos/{user}/{repo}/{path}", headers=github_headers(), timeout=10)
+    if resp.status_code == 404:
+        return expected()
+    if resp.status_code != 200:
+        raise ValueError(f"{path} returned HTTP {resp.status_code}")
+    payload = resp.json()
+    if not isinstance(payload, expected):
+        raise ValueError(f"{path} returned an unexpected JSON shape")
+    return payload
+
+
 def list_root_files(user: str, repo: str) -> set[str]:
     """Lower-cased names of the files in the repo root, from one API call."""
-    url = f"{API_BASE}/repos/{user}/{repo}/contents/"
-    resp = _rate_limited_get(url, headers=github_headers(), timeout=10)
-    if resp.status_code != 200:
-        return set()
-    try:
-        entries = resp.json()
-    except ValueError:
-        return set()
-    if not isinstance(entries, list):
-        return set()
+    entries = _repo_field(user, repo, "contents/", list)
     return {str(e.get("name", "")).lower() for e in entries if isinstance(e, dict)}
 
 
 def check_ci_exists(user: str, repo: str) -> bool:
-    """Check if the repo has a GitHub Actions workflow."""
-    url = f"{API_BASE}/repos/{user}/{repo}/contents/.github/workflows"
-    resp = _rate_limited_get(url, headers=github_headers(), timeout=10)
-    if resp.status_code == 200:
-        try:
-            files = resp.json()
-            return isinstance(files, list) and len(files) > 0
-        except (ValueError, TypeError):
-            return False
-    return False
+    """Check for a YAML workflow file in the GitHub Actions directory."""
+    return any(
+        isinstance(f, dict) and f.get("type", "file") == "file"
+        and str(f.get("name", "")).endswith((".yml", ".yaml"))
+        for f in _repo_field(user, repo, "contents/.github/workflows", list)
+    )
 
 
 def check_topics(user: str, repo: str) -> list[str]:
-    """Fetch topics/tags for a repo."""
-    url = f"{API_BASE}/repos/{user}/{repo}/topics"
-    resp = _rate_limited_get(
-        url,
-        headers={**github_headers(), "Accept": "application/vnd.github.mercy-preview+json"},
-        timeout=10,
-    )
-    if resp.status_code == 200:
-        return resp.json().get("names", [])
-    return []
+    """Fetch topics for an older listing payload without them."""
+    payload = _repo_field(user, repo, "topics", dict)
+    names = payload.get("names", [])
+    if not isinstance(names, list):
+        raise ValueError("topics returned an unexpected names field")
+    return names
 
 
 def check_repo_health(user: str, repo: dict) -> dict:
     """
     Run all health checks for a single repo and return its result dict.
 
-    This function is designed to be called from a thread pool. Its three
-    GitHub API calls (root listing for README/LICENSE, CI, topics) are issued
-    from the same thread so they can run concurrently across repos.
+    Each worker fetches the root and workflows, reusing topics from the listing.
     """
     name = repo["name"]
     root_files = list_root_files(user, name)
     has_readme = bool(root_files & README_NAMES)
     has_license = bool(root_files & LICENSE_NAMES)
     has_ci = check_ci_exists(user, name)
-    topics = check_topics(user, name)
+    topics = repo.get("topics")
+    if not isinstance(topics, list):
+        topics = check_topics(user, name)
     score, flags = score_repo(repo, has_readme, has_license, has_ci, topics)
 
     pushed_at = repo.get("pushed_at") or "N/A"
@@ -368,7 +363,7 @@ def main(argv=None):
     GITHUB_USER = args.user
     STALE_DAYS = args.stale_days
 
-    console = Console()
+    console = Console(stderr=args.json)
 
     if not GITHUB_TOKEN:
         console.print("[yellow]Warning: No GITHUB_TOKEN set. Rate limits will apply (60 req/hr).[/yellow]")
@@ -377,7 +372,9 @@ def main(argv=None):
 
     repos = fetch_repos(GITHUB_USER)
     if not repos:
-        console.print("[red]No repos found or API error.[/red]")
+        console.print("[yellow]No repos found.[/yellow]")
+        if args.json:
+            print("[]")
         return
 
     workers = max(1, min(args.parallel, len(repos)))
@@ -389,8 +386,7 @@ def main(argv=None):
     previous_scores = load_previous_report()
     results = []
 
-    # Parallel health checks — each repo's 4 API calls run in its own thread,
-    # so N repos finish in ~1 serial-time instead of ~N serial-times.
+    # Each worker checks one repository at a time.
     with ThreadPoolExecutor(max_workers=workers) as pool:
         future_to_repo = {
             pool.submit(check_repo_health, GITHUB_USER, repo): repo
@@ -410,6 +406,9 @@ def main(argv=None):
             console.print(f"  ✓ [cyan]{result['name']}[/cyan] — {result['score']}/100", end="\r")
 
     console.print()  # clear the \r line
+    if len(results) != len(repos):
+        console.print("[red]Incomplete scan. No report was written.[/red]")
+        sys.exit(1)
 
     # Sort
     results = sort_results(results, args.sort, descending=not args.asc)
