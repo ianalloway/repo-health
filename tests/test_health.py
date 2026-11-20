@@ -277,6 +277,41 @@ def test_main_json_output_end_to_end(capsys, monkeypatch):
     with mock.patch.object(health.requests, "get", side_effect=fake_get):
         health.main(["--user", "me", "--json", "--no-save", "-P", "1"])
     out = capsys.readouterr().out
-    data = json.loads(out[out.index("["):])
+    data = json.loads(out)
     assert [r["name"] for r in data] == ["r1"]
     assert data[0]["score"] == 100
+
+def test_main_json_empty_account(capsys, monkeypatch):
+    monkeypatch.setattr(health, "fetch_repos", lambda user: [])
+    health.main(["--json", "--no-save"])
+    assert json.loads(capsys.readouterr().out) == []
+
+
+@pytest.mark.parametrize("topics", [[], ["tool"]])
+def test_topics_returned_by_listing_avoid_extra_request(topics):
+    repo = healthy_repo(topics=topics)
+    with mock.patch.object(health, "list_root_files", return_value={"readme.md", "license"}), \
+         mock.patch.object(health, "check_ci_exists", return_value=True), \
+         mock.patch.object(health, "check_topics") as fetch:
+        assert health.check_repo_health("me", repo)["topics"] == topics
+    fetch.assert_not_called()
+
+def test_failed_second_page_exits_instead_of_returning_a_partial_inventory():
+    pages = [FakeResp(200, [{"name": "first"}]), FakeResp(503)]
+    with mock.patch.object(health.requests, "get", side_effect=pages), pytest.raises(SystemExit) as exc:
+        health.fetch_repos("me")
+    assert exc.value.code == 1
+
+@pytest.mark.parametrize("response", [FakeResp(503), FakeResp(200, {"invalid": True})])
+def test_unavailable_metadata_aborts_before_scoring_or_saving(response, monkeypatch, tmp_path):
+    monkeypatch.setattr(health, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(health, "fetch_repos", lambda user: [healthy_repo()])
+    with mock.patch.object(health.requests, "get", return_value=response), pytest.raises(SystemExit) as exc:
+        health.main(["--json"])
+    assert exc.value.code == 1
+    assert not list(tmp_path.iterdir())
+
+
+def test_workflow_directory_must_contain_workflow_yaml():
+    with mock.patch.object(health.requests, "get", return_value=FakeResp(200, [{"name": "README.md"}])):
+        assert not health.check_ci_exists("me", "repo")

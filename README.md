@@ -61,7 +61,7 @@ Options:
 --no-save          Skip saving report files
 --stale-days N     Days before a repo is considered stale (default: 90)
 --min-score N      Only show repos scoring below N
---json             Print results as JSON
+--json             Write one JSON array to stdout (progress goes to stderr)
 --sort COLUMN      score | name | stars | last_push | open_issues (default: score)
 --asc              Sort ascending
 --parallel, -P N   Concurrent repo checks (default: 8)
@@ -70,7 +70,7 @@ Options:
 
 ## API usage and rate limits
 
-A run makes 1 request per 100 repos to list them, plus 3 per repo (root listing for README and LICENSE, workflows, topics). For example, 50 repos take about 151 requests. Requests are spaced about 0.15 s apart across all threads.
+The scanner fetches the repository list in pages of 100 and stops at the first empty page. Each repository adds two requests, one for the root files and one for workflows. Older responses without topics require a third request. If metadata becomes unavailable mid-scan, the CLI exits with status 1 to keep an incomplete scorecard out of the saved history. Requests are spaced about 0.15 s apart across all threads.
 
 On HTTP 429, or a 403 that GitHub marks as rate limited, the tool backs off and retries up to 5 times. It honours `Retry-After` and `X-RateLimit-Reset`, and gives up rather than hang if the reset is more than 60 s away.
 
